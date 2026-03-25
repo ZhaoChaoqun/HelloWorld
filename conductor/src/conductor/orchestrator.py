@@ -224,7 +224,7 @@ class Orchestrator:
             self.tmux.update_pane_status("planning-jobs", "done", "Jobs ✅")
             self.tmux.update_pane_status("planning-torvalds", "done", "Torvalds ✅")
 
-        # Merge plans — Torvalds as Lead (technical projects)
+        # Merge plans — 交叉审核：将两份计划传给 Torvalds 综合合并
         jobs_plan = results[0][1] if results[0][1] else {}
         torvalds_plan = results[1][1] if results[1][1] else {}
 
@@ -238,13 +238,12 @@ class Orchestrator:
             self.log(f"   分析: {torvalds_plan.get('task_analysis', 'N/A')[:100]}")
             self.log(f"   步骤数: {len(torvalds_plan.get('steps', []))}")
 
-        # Use Torvalds' plan as the primary (technical lead)
-        # Fall back to Jobs' plan if Torvalds' is empty
-        primary = torvalds_plan if torvalds_plan.get("steps") else jobs_plan
+        # 交叉审核 + Lead 合并：Torvalds 作为 Lead，综合两份计划
+        merged_plan = await self._merge_plans(jobs_plan, torvalds_plan)
 
-        if not primary or not primary.get("steps"):
-            self.log("⚠️ 两个 Planning Actor 都没产出有效计划，使用默认单步计划")
-            primary = {
+        if not merged_plan or not merged_plan.get("steps"):
+            self.log("⚠️ 计划合并失败，使用默认单步计划")
+            merged_plan = {
                 "task_analysis": self.state.description,
                 "steps": [
                     {
@@ -260,7 +259,7 @@ class Orchestrator:
                 "risks": [],
             }
 
-        self.state.plan = ExecutionPlan.from_dict(primary)
+        self.state.plan = ExecutionPlan.from_dict(merged_plan)
         self.state.add_memory(
             f"Plan confirmed: {len(self.state.plan.steps)} steps"
         )
@@ -273,6 +272,69 @@ class Orchestrator:
         if self.tmux:
             self.tmux.release_pane("planning-jobs")
             self.tmux.release_pane("planning-torvalds")
+
+    async def _merge_plans(
+        self,
+        jobs_plan: dict[str, Any],
+        torvalds_plan: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Cross-review and merge two planning outputs.
+
+        Spawns Torvalds as Lead to review both plans and produce
+        a merged ExecutionPlan. This implements the "交叉审核 → Lead 合并"
+        step from the design doc (section 6.2.3).
+        """
+        # If either plan is empty, return the other directly
+        if not jobs_plan or not jobs_plan.get("steps"):
+            return torvalds_plan
+        if not torvalds_plan or not torvalds_plan.get("steps"):
+            return jobs_plan
+
+        self.log("\n🔀 交叉审核：Torvalds 作为 Lead 合并两份计划...")
+
+        merge_id = "merge-torvalds"
+        if self.tmux:
+            self.tmux.assign_actor(merge_id, "Torvalds", "planning(merge)")
+
+        merge_prompt = (
+            f"你需要合并以下两份执行计划，产出最终的 ExecutionPlan。\n\n"
+            f"## 原始任务\n{self.state.description}\n\n"
+            f"## Jobs 的计划（产品/用户视角）\n"
+            f"{json.dumps(jobs_plan, ensure_ascii=False, indent=2)}\n\n"
+            f"## Torvalds 的计划（架构/技术视角）\n"
+            f"{json.dumps(torvalds_plan, ensure_ascii=False, indent=2)}\n\n"
+            f"## 合并要求\n"
+            f"- 以技术方案为骨架（你是技术 Lead）\n"
+            f"- 吸纳 Jobs 计划中关于用户体验和验收标准的合理建议\n"
+            f"- 如果两份计划有冲突，以技术可行性为优先\n"
+            f"- 确保步骤间依赖关系正确\n"
+            f"- 标记可并行执行的步骤"
+        )
+
+        actor, result = await spawn_actor(
+            persona=TORVALDS,
+            specialty="planning",
+            task_context={
+                "task_id": self.state.task_id,
+                "task_description": merge_prompt,
+            },
+            personas_dir=self.personas_dir,
+            cwd=self.project_dir,
+            timeout=self.actor_timeout,
+        )
+
+        if self.tmux:
+            status = "done" if actor.status == ActorStatus.DONE else "failed"
+            self.tmux.update_pane_status(merge_id, status, f"Torvalds merge {status}")
+            self.tmux.release_pane(merge_id)
+
+        if result and result.get("steps"):
+            self.log("   ✅ 计划合并完成")
+            return result
+
+        # Fallback: if merge fails, use Torvalds' original plan
+        self.log("   ⚠️ 合并失败，回退到 Torvalds 原始计划")
+        return torvalds_plan
 
     # ── Phase 3: EXECUTION ─────────────────────────────────────────
 
@@ -502,12 +564,66 @@ class Orchestrator:
                 f"Step {step.step_id} QG failed iteration {iteration + 1}"
             )
 
-            # If not the last iteration, we'd rework here
-            # For MVP, just log the failure and continue to next iteration
+            # Rework: spawn coding actor to fix issues based on review/testing feedback
             if iteration < self.state.max_iterations - 1:
-                self.log("   🔧 触发修改...")
-                # In a full implementation, we'd spawn a coding actor
-                # to fix the issues and then re-run quality gate
+                self.log("   🔧 触发 rework — spawn coding actor 修复问题...")
+
+                feedback_parts = []
+                if not review_pass and review_result.get("issues"):
+                    issues_text = "\n".join(
+                        f"  - [{i.get('severity', 'unknown')}] {i.get('description', '')}"
+                        for i in review_result["issues"]
+                    )
+                    feedback_parts.append(f"Review 问题:\n{issues_text}")
+                if not review_pass and review_result.get("summary"):
+                    feedback_parts.append(f"Review 总结: {review_result['summary']}")
+                if not testing_pass and testing_result.get("bugs"):
+                    bugs_text = "\n".join(
+                        f"  - [{b.get('severity', 'unknown')}] {b.get('description', '')}"
+                        for b in testing_result["bugs"]
+                    )
+                    feedback_parts.append(f"测试发现的 bug:\n{bugs_text}")
+                if not testing_pass and testing_result.get("summary"):
+                    feedback_parts.append(f"测试总结: {testing_result['summary']}")
+
+                feedback = "\n\n".join(feedback_parts) if feedback_parts else "Quality Gate 未通过，请修复问题。"
+
+                rework_id = f"rework-{step.persona_id}-s{step.step_id}-i{iteration}"
+                rework_persona = get_persona(step.persona_id)
+
+                if self.tmux:
+                    self.tmux.assign_actor(rework_id, rework_persona.name, "coding(rework)")
+
+                rework_actor, rework_result = await spawn_actor(
+                    persona=rework_persona,
+                    specialty="coding",
+                    task_context={
+                        "task_id": self.state.task_id,
+                        "task_description": self.state.description,
+                        "assigned_step": (
+                            f"修复步骤 {step.step_id} 的质量问题：\n\n"
+                            f"原始任务: {step.description}\n\n"
+                            f"审查/测试反馈:\n{feedback}\n\n"
+                            f"请根据以上反馈修复代码中的问题。"
+                        ),
+                        "worktree_path": str(self.project_dir),
+                    },
+                    personas_dir=self.personas_dir,
+                    cwd=self.project_dir,
+                    timeout=self.actor_timeout,
+                )
+
+                if self.tmux:
+                    rework_status = "done" if rework_actor.status == ActorStatus.DONE else "failed"
+                    self.tmux.update_pane_status(rework_id, rework_status, f"{rework_persona.name} rework {rework_status}")
+                    self.tmux.release_pane(rework_id)
+
+                if rework_actor.status == ActorStatus.DONE:
+                    self.log(f"   🔧 Rework 完成，重新进入 Quality Gate...")
+                    # Update coding_result for next QG iteration
+                    coding_result = rework_result
+                else:
+                    self.log(f"   ❌ Rework 失败")
 
         self.log(f"   ❌ 超过最大迭代次数 ({self.state.max_iterations})，Quality Gate 失败")
         return False
